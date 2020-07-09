@@ -36,6 +36,12 @@ from engine import train_one_epoch, evaluate
 import utils
 import transforms as T
 
+try:
+    from apex import amp
+    import apex
+except ImportError:
+    amp = None
+
 
 def get_dataset(name, image_set, transform, data_path):
     paths = {
@@ -97,14 +103,19 @@ def main(args):
                                                               pretrained=args.pretrained)
     model.to(device)
 
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
         params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
+    model_without_ddp = model
+    if args.distributed:
+        if args.apex:
+            model, optimizer = amp.initialize(model, optimizer, opt_level=args.apex_opt_level)
+            model.roi_heads.box_roi_pool.forward = amp.half_function(model.roi_heads.box_roi_pool.forward)
+            model = apex.parallel.DistributedDataParallel(model)
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
 
     # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_steps, gamma=args.lr_gamma)
@@ -125,7 +136,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq)
+        train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, apex=args.apex)
         lr_scheduler.step()
         if args.output_dir:
             utils.save_on_master({
@@ -192,6 +203,10 @@ if __name__ == "__main__":
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
+
+    # Mixed precision training parameters
+    parser.add_argument('--apex', action='store_true', help='Use Apex for mixed precision training')
+    parser.add_argument('--apex-opt-level', default='O1', type=str, help='For Apex mixed precision training. O0 for FP32 training, O1 for mixed precision training.')
 
     args = parser.parse_args()
 
